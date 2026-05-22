@@ -1,7 +1,97 @@
 Metadata-Version: 2.4
 Name: cleanframe
-Version: 0.3.0
+Version: 1.0.0
+Summary: Declarative data cleaning contracts for pandas.
+Author-email: Your Name <your@email.com>
+License-Expression: MIT
+Keywords: pandas,data cleaning
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
 Requires-Python: >=3.8
-Requires-Dist: pandas
-Dynamic: requires-dist
-Dynamic: requires-python
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=1.3
+Requires-Dist: numpy>=1.21
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: twine; extra == "dev"
+Requires-Dist: build; extra == "dev"
+
+# cleanframe
+
+**Declarative data cleaning contracts for pandas. Annotation-based. Zero API calls. Offline-first.**
+
+```python
+from cleanframe import clean, Col, Schema
+
+schema = Schema(
+    age    = Col(null="median",  clip=(0, 120)),
+    salary = Col(null="median",  clip=(0, 999_999)),
+    dept   = Col(null="Unknown", dtype="category"),
+)
+
+@clean(schema)
+def train_model(df):
+    model.fit(df)
+
+result = train_model(dirty_df)
+print(result.explain())
+print(result.to_code())
+```
+
+## Install
+
+```bash
+pip install cleanframe
+```
+
+## Decorators
+
+| Decorator | What it does |
+|-----------|-------------|
+| `@clean(schema)` | Cleans the DataFrame before the function runs, returns a `CleanResult` |
+| `@validate(schema)` | Raises `DataQualityError` if data is dirty — never modifies |
+| `@audit(schema)` | Like `@clean` but also prints a full change log |
+| `@profile` | Prints a data quality report, no schema needed |
+| `@pipeline(s1, s2, ...)` | Applies multiple schemas in sequence |
+
+## Col() options
+
+```python
+Col(
+    null="median",   # mean | median | mode | drop | ffill | bfill | auto | ignore | <scalar>
+    clip=(0, 120),   # clip numeric values to [min, max]
+    dtype="float",   # int | float | str | bool | category | datetime
+    rename="age_yr", # rename column after cleaning
+    required=True,   # raise KeyError if column is missing
+)
+```
+
+## CleanResult
+
+```python
+result.df            # cleaned DataFrame
+result.explain()     # human-readable change report
+result.to_code()     # equivalent pandas code (no cleanframe dependency)
+result.summary()     # one-line summary
+result.return_value  # what your function returned
+```
+
+## Modes
+
+```python
+@clean(schema, mode="fix")    # default — clean silently
+@clean(schema, mode="warn")   # clean and emit UserWarning per change
+@clean(schema, mode="raise")  # raise DataQualityError instead of cleaning
+```
+
+## Requirements
+
+- Python >= 3.8
+- pandas >= 1.3
+- numpy >= 1.21
+
+## License
+
+MIT

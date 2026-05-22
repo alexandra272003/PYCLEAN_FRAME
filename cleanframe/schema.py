@@ -1,131 +1,135 @@
 """
-cleanframe.schema
-=================
-Col() and Schema() — the user-facing building blocks.
-
-These are pure config objects. No pandas, no cleaning logic.
-They only store what the user declared.
-
-Example
--------
-    Schema(
-        age        = Col(null="median",  clip=(0, 120)),
-        salary_usd = Col(null="median",  clip=(0, 999_999)),
-        department = Col(null="Unknown", dtype="category"),
-        joined_on  = Col(null="ffill",   required=True),
-    )
+cleanframe/schema.py
+Col() and Schema() — the building blocks of a cleaning contract.
 """
-
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Union
 
+from .exceptions import CleanFrameConfigError
 
-_NULL_STRATEGIES = {
+# Valid string null strategies
+_NULL_STRATEGIES = frozenset({
     "mean", "median", "mode",
     "drop", "ffill", "bfill",
     "auto", "ignore",
-}
+})
 
-_VALID_DTYPES = {
-    "int", "int32", "int64",
-    "float", "float32", "float64",
-    "str", "string", "bool",
-    "category", "datetime",
-}
+# Valid dtype targets
+_DTYPES = frozenset({"int", "float", "str", "bool", "category", "datetime"})
 
 
 @dataclass
 class Col:
     """
-    Cleaning contract for ONE column.
+    Cleaning contract for a single column.
 
     Parameters
     ----------
-    null : str or scalar
-        How to handle nulls.
-        Strategies : "mean" "median" "mode" "drop" "ffill" "bfill" "auto" "ignore"
-        Scalar     : any value (0, -1, "Unknown", False) used as fill directly
+    null : str or scalar, optional
+        How to handle missing values.
+        String strategies: "mean", "median", "mode", "drop",
+                           "ffill", "bfill", "auto", "ignore"
+        Scalar (int, float, str): fill with that exact value.
+        Default: "ignore" (do nothing).
 
-    clip : (min, max) tuple
-        Clip values to this range. Numeric columns only.
+    clip : (min, max) tuple, optional
+        Clip numeric values to this range. Skipped for non-numeric columns.
 
-    dtype : str
-        Coerce to this dtype after cleaning.
+    dtype : str, optional
+        Coerce column to this dtype after cleaning.
+        Options: "int", "float", "str", "bool", "category", "datetime"
 
-    rename : str
-        Rename column after all cleaning is done.
+    rename : str, optional
+        Rename the column after all other operations.
 
     required : bool
-        If True and column missing from df raises KeyError.
-        Default False = silently skip missing columns.
+        If True, raise KeyError when this column is missing from the DataFrame.
+        Default: False (silently skip missing columns).
 
     Examples
     --------
-        Col(null="median", clip=(0, 120))
-        Col(null="Unknown", dtype="category")
-        Col(null=0)
-        Col(null="auto")
-        Col(null="median", required=True, rename="age_clean")
+    >>> Col(null="median", clip=(0, 120), dtype="float")
+    Col(null='median', clip=(0, 120), dtype='float')
+
+    >>> Col(null="Unknown", required=True)
+    Col(null='Unknown', required=True)
     """
 
-    null: Any = None
-    clip: Optional[Tuple[Any, Any]] = None
+    null: Union[str, int, float, None] = "ignore"
+    clip: Optional[Tuple[float, float]] = None
     dtype: Optional[str] = None
     rename: Optional[str] = None
     required: bool = False
 
     def __post_init__(self):
-        if self.clip is not None:
-            if (
-                not isinstance(self.clip, (tuple, list))
-                or len(self.clip) != 2
-            ):
-                raise ValueError(
-                    f"Col.clip must be a (min, max) tuple, got {self.clip!r}.\n"
-                    f"Example: clip=(0, 120)"
-                )
-            self.clip = tuple(self.clip)
+        # Any string is valid: either a named strategy or a literal scalar fill value.
+        # (e.g. Col(null="Unknown") fills nulls with the string "Unknown")
 
-        if self.dtype is not None and self.dtype not in _VALID_DTYPES:
-            raise ValueError(
-                f"Col.dtype={self.dtype!r} not recognised.\n"
-                f"Supported: {sorted(_VALID_DTYPES)}"
+        # Validate clip
+        if self.clip is not None:
+            if not (isinstance(self.clip, (tuple, list)) and len(self.clip) == 2):
+                raise CleanFrameConfigError("clip must be a (min, max) tuple.")
+            if self.clip[0] >= self.clip[1]:
+                raise CleanFrameConfigError(
+                    f"clip min ({self.clip[0]}) must be less than clip max ({self.clip[1]})."
+                )
+
+        # Validate dtype
+        if self.dtype is not None and self.dtype not in _DTYPES:
+            raise CleanFrameConfigError(
+                f"Unknown dtype '{self.dtype}'. Valid options: {sorted(_DTYPES)}"
             )
+
+    def __repr__(self):
+        parts = []
+        if self.null != "ignore":
+            parts.append(f"null={self.null!r}")
+        if self.clip is not None:
+            parts.append(f"clip={self.clip}")
+        if self.dtype is not None:
+            parts.append(f"dtype={self.dtype!r}")
+        if self.rename is not None:
+            parts.append(f"rename={self.rename!r}")
+        if self.required:
+            parts.append("required=True")
+        return f"Col({', '.join(parts)})" if parts else "Col()"
 
 
 class Schema:
     """
-    Groups Col() declarations for a whole DataFrame.
+    Cleaning contract for a DataFrame — a collection of Col() rules.
 
-    Only declare columns you want cleaned.
-    All other columns pass through untouched.
+    Parameters
+    ----------
+    **columns : Col
+        Keyword arguments where the key is the column name and
+        the value is a Col() instance.
 
-    Example
-    -------
-        Schema(
-            age    = Col(null="median", clip=(0, 120)),
-            salary = Col(null="median", clip=(0, 999_999)),
-            dept   = Col(null="Unknown", dtype="category"),
-        )
+    Examples
+    --------
+    >>> schema = Schema(
+    ...     age    = Col(null="median", clip=(0, 120)),
+    ...     salary = Col(null="median", clip=(0, 999_999)),
+    ...     dept   = Col(null="Unknown", dtype="category"),
+    ... )
     """
 
-    def __init__(self, **columns: Col):
-        for name, rule in columns.items():
-            if not isinstance(rule, Col):
+    def __init__(self, **columns):
+        for name, col in columns.items():
+            if not isinstance(col, Col):
                 raise TypeError(
-                    f"Schema: '{name}' must be a Col() instance, "
-                    f"got {type(rule).__name__}.\n"
-                    f"Example: Schema(age=Col(null='median'))"
+                    f"Schema expects Col() instances, got {type(col).__name__!r} for '{name}'. "
+                    f"Use: Schema(age=Col(null='median')) not Schema(age='median')"
                 )
-        self.cols = columns
+        self.columns: dict[str, Col] = columns
+
+    def __len__(self):
+        return len(self.columns)
 
     def __repr__(self):
-        parts = ", ".join(
-            f"{k}=Col(null={v.null!r}, clip={v.clip!r})"
-            for k, v in self.cols.items()
-        )
-        return f"Schema({parts})"
+        cols = ", ".join(f"{k}={v!r}" for k, v in self.columns.items())
+        return f"Schema({cols})"
 
-    def column_names(self):
-        return list(self.cols.keys())
+    def __iter__(self):
+        return iter(self.columns.items())

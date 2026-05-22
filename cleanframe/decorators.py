@@ -1,68 +1,55 @@
 """
-cleanframe.decorators
-=====================
-The 5 decorators — the main user-facing API.
-
-@clean(schema)          — clean df before function runs
-@validate(schema)       — raise if dirty, never fix
-@audit(schema)          — clean + print full change log
-@profile                — print df health report, no cleaning
-@pipeline(s1, s2, ...)  — chain multiple schemas in order
-
-All decorators:
-  - preserve the original function's name and docstring (functools.wraps)
-  - handle both positional (func(df)) and keyword (func(df=df)) calls
-  - never mutate the original DataFrame
-  - return the function's own return value (never swallow it)
+cleanframe/decorators.py
+The 5 decorators: @clean, @validate, @audit, @profile, @pipeline
 """
+from __future__ import annotations
 
-import functools
 import inspect
+import warnings
+import functools
 import pandas as pd
 
-from .engine import apply_schema, CleanResult
 from .schema import Schema
+from .engine import apply_schema
+from .result import CleanResult
+from .utils import collect_issues
+from .exceptions import DataQualityError
 
 
-def _get_df_arg(func, args, kwargs):
+# ── Helper: find the DataFrame argument ───────────────────────────────────────
+
+def _get_df_arg(func, args, kwargs) -> tuple[pd.DataFrame, str | int]:
     """
-    Find the DataFrame argument in args/kwargs.
-
-    Looks for the FIRST pd.DataFrame parameter by position.
-    Handles both positional and keyword calls.
-
-    Returns
-    -------
-    (index_or_key, df, is_positional)
-      index_or_key : int (position) or str (kwarg key)
-      df           : the DataFrame
-      is_positional: True if found in args
+    Find the pd.DataFrame argument from args/kwargs.
+    Returns (dataframe, key) where key is the kwarg name or positional index.
     """
-    param_names = list(inspect.signature(func).parameters.keys())
+    sig = inspect.signature(func)
+    params = list(sig.parameters.keys())
 
-    # check positional args first
-    for i, (name, val) in enumerate(zip(param_names, args)):
-        if isinstance(val, pd.DataFrame):
-            return i, val, True
+    # Check kwargs first
+    for k, v in kwargs.items():
+        if isinstance(v, pd.DataFrame):
+            return v, k
 
-    # check keyword args
-    for name, val in kwargs.items():
-        if isinstance(val, pd.DataFrame):
-            return name, val, False
+    # Check positional args
+    for i, v in enumerate(args):
+        if isinstance(v, pd.DataFrame):
+            return v, i
 
-    return None, None, False
+    raise TypeError(
+        f"cleanframe: could not find a pd.DataFrame argument in call to "
+        f"'{func.__name__}'. Positional params: {params}"
+    )
 
 
-def _replace_df_arg(args, kwargs, index_or_key, new_df, is_positional):
-    """
-    Replace the DataFrame in args or kwargs with cleaned version.
-    Returns (new_args, new_kwargs).
-    """
-    args = list(args)
-    if is_positional:
-        args[index_or_key] = new_df
+def _inject_df(args, kwargs, key, new_df) -> tuple[tuple, dict]:
+    """Replace the DataFrame in args/kwargs with new_df."""
+    if isinstance(key, str):
+        kwargs = {**kwargs, key: new_df}
     else:
-        kwargs[index_or_key] = new_df
+        args = list(args)
+        args[key] = new_df
+        args = tuple(args)
     return args, kwargs
 
 
@@ -70,287 +57,276 @@ def _replace_df_arg(args, kwargs, index_or_key, new_df, is_positional):
 
 def clean(schema: Schema, mode: str = "fix"):
     """
-    Clean the DataFrame argument before the function body runs.
+    Decorator that cleans the DataFrame before the function runs.
 
     Parameters
     ----------
     schema : Schema
-        Declares which columns to clean and how.
-    mode : "fix" | "warn"
-        fix  — clean silently (default)
-        warn — clean AND print log of every change
+        The cleaning contract (Col rules per column).
+    mode : str
+        "fix"   — clean silently (default)
+        "warn"  — clean and emit UserWarning per change
+        "raise" — raise DataQualityError instead of cleaning
 
     Returns
     -------
-    The decorated function returns a CleanResult.
-    Access cleaned df via result.df, explain via result.explain(),
-    code via result.to_code().
+    CleanResult
+        .df           — cleaned DataFrame
+        .explain()    — human-readable report
+        .to_code()    — equivalent pandas code
+        .return_value — what your function returned
 
-    Example
-    -------
-        schema = Schema(
-            age    = Col(null="median", clip=(0, 120)),
-            salary = Col(null="median", clip=(0, 999_999)),
-            dept   = Col(null="Unknown"),
-        )
-
-        @clean(schema)
-        def train_model(df):
-            model.fit(df)
-
-        result = train_model(dirty_df)
-        print(result.explain())
-        print(result.to_code())
+    Examples
+    --------
+    >>> schema = Schema(age=Col(null="median", clip=(0, 120)))
+    >>> @clean(schema)
+    ... def train(df):
+    ...     model.fit(df)
+    >>> result = train(dirty_df)
+    >>> print(result.explain())
     """
     if not isinstance(schema, Schema):
         raise TypeError(
-            f"@clean expects a Schema as first argument, got {type(schema).__name__}.\n"
-            f"Usage: @clean(schema)  where schema = Schema(...)"
-        )
-    if mode not in ("fix", "warn"):
-        raise ValueError(
-            f"@clean mode must be 'fix' or 'warn', got {mode!r}.\n"
-            f"Use @validate(schema) to raise on dirty data."
+            f"@clean expects a Schema instance, got {type(schema).__name__}. "
+            f"Usage: @clean(Schema(col=Col(...)))"
         )
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            idx, df, is_pos = _get_df_arg(func, args, kwargs)
+            df, key = _get_df_arg(func, args, kwargs)
+            cleaned_df, steps = apply_schema(df, schema, mode=mode)
+            args, kwargs = _inject_df(args, kwargs, key, cleaned_df)
+            return_value = func(*args, **kwargs)
+            return CleanResult(
+                df=cleaned_df,
+                steps=steps,
+                return_value=return_value,
+                func_name=func.__name__,
+            )
 
-            if df is None:
-                # no DataFrame found — call function as-is
-                return func(*args, **kwargs)
-
-            result = apply_schema(df, schema, mode=mode)
-            args, kwargs = _replace_df_arg(args, kwargs, idx, result.df, is_pos)
-
-            # call original function with cleaned df
-            func(*args, **kwargs)
-
-            # always return CleanResult so user can call .explain() / .to_code()
-            return result
-
+        wrapper._cleanframe_decorator = "clean"
+        wrapper._cleanframe_schema = schema
         return wrapper
+
     return decorator
 
 
-# ── @validate ─────────────────────────────────────────────────────────────────
+# ── @validate ────────────────────────────────────────────────────────────────
 
 def validate(schema: Schema):
     """
-    Validate the DataFrame — raise DataQualityError if dirty.
-    Never fixes data. Use in production APIs where bad data = hard stop.
+    Decorator that validates the DataFrame and raises DataQualityError if dirty.
+    Never modifies data. Use in production APIs / critical pipelines.
 
     Parameters
     ----------
     schema : Schema
+        The validation contract.
 
     Raises
     ------
     DataQualityError
-        If any declared column has nulls or out-of-range values.
+        If any null or out-of-range issues are found.
 
-    Example
-    -------
-        @validate(schema)
-        def predict(df):
-            return model.predict(df)
-
-        try:
-            predict(dirty_df)
-        except DataQualityError as e:
-            print(e.issues)  # structured list of problems
+    Examples
+    --------
+    >>> @validate(schema)
+    ... def predict(df):
+    ...     return model.predict(df)
+    >>> try:
+    ...     predict(dirty_df)
+    ... except DataQualityError as e:
+    ...     print(e.issues)
     """
     if not isinstance(schema, Schema):
         raise TypeError(
-            f"@validate expects a Schema, got {type(schema).__name__}."
+            f"@validate expects a Schema instance, got {type(schema).__name__}."
         )
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            idx, df, is_pos = _get_df_arg(func, args, kwargs)
-
-            if df is not None:
-                # raises DataQualityError if dirty — never fixes
-                apply_schema(df, schema, mode="raise")
-
-            # data is clean — call original and return its result
+            df, _ = _get_df_arg(func, args, kwargs)
+            issues = collect_issues(df, schema)
+            if issues:
+                raise DataQualityError(issues)
             return func(*args, **kwargs)
 
+        wrapper._cleanframe_decorator = "validate"
+        wrapper._cleanframe_schema = schema
         return wrapper
+
     return decorator
 
 
 # ── @audit ────────────────────────────────────────────────────────────────────
 
-def audit(schema: Schema):
+def audit(schema: Schema, mode: str = "fix"):
     """
-    Clean the df AND print a full audit log of every change made.
-    Use during development, debugging, or in compliance pipelines.
+    Decorator that cleans the DataFrame AND prints a full change log.
+    Ideal during development and debugging.
 
-    Returns CleanResult — access .steps for structured log,
-    or .explain() for human-readable output.
+    Parameters
+    ----------
+    schema : Schema
+        The cleaning contract.
+    mode : str
+        "fix" or "warn" (same as @clean).
 
-    Example
-    -------
-        @audit(schema)
-        def process(df):
-            pass
-
-        result = process(df)
-        # prints full change log automatically
-        for step in result.steps:
-            print(step["column"], step["operation"])
+    Examples
+    --------
+    >>> @audit(schema)
+    ... def process(df):
+    ...     pass
+    >>> process(df)   # prints change log automatically
     """
     if not isinstance(schema, Schema):
         raise TypeError(
-            f"@audit expects a Schema, got {type(schema).__name__}."
+            f"@audit expects a Schema instance, got {type(schema).__name__}."
         )
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            idx, df, is_pos = _get_df_arg(func, args, kwargs)
-
-            if df is None:
-                return func(*args, **kwargs)
-
-            # mode="warn" cleans AND prints the log
-            result = apply_schema(df, schema, mode="warn")
-            args, kwargs = _replace_df_arg(args, kwargs, idx, result.df, is_pos)
-            func(*args, **kwargs)
+            df, key = _get_df_arg(func, args, kwargs)
+            cleaned_df, steps = apply_schema(df, schema, mode=mode)
+            args, kwargs = _inject_df(args, kwargs, key, cleaned_df)
+            return_value = func(*args, **kwargs)
+            result = CleanResult(
+                df=cleaned_df,
+                steps=steps,
+                return_value=return_value,
+                func_name=func.__name__,
+            )
+            print(result.explain())
             return result
 
+        wrapper._cleanframe_decorator = "audit"
+        wrapper._cleanframe_schema = schema
         return wrapper
+
     return decorator
 
 
-# ── @profile ──────────────────────────────────────────────────────────────────
+# ── @profile ─────────────────────────────────────────────────────────────────
 
 def profile(func):
     """
-    Print a data quality report before running the function.
-    No Schema needed. No cleaning. Just shows you what's in the df.
+    Decorator that prints a data quality report before the function runs.
+    No schema needed. No cleaning. Just inspection.
 
-    Use as the first step when exploring a new dataset.
-
-    Example
-    -------
-        @profile
-        def explore(df):
-            pass
-
-        explore(df)
-        # prints: shape, dtypes, null counts, skewness, top values
+    Examples
+    --------
+    >>> @profile
+    ... def explore(df):
+    ...     pass
+    >>> explore(df)
+    # cleanframe @profile  →  explore()
+    # Shape : 1000 rows × 5 columns
+    # Column     dtype    nulls  null%   note
+    # ...
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        _, df, _ = _get_df_arg(func, args, kwargs)
-
-        if df is not None:
-            _print_profile(df, func.__name__)
-
+        df, _ = _get_df_arg(func, args, kwargs)
+        _print_profile(df, func.__name__)
         return func(*args, **kwargs)
+
+    wrapper._cleanframe_decorator = "profile"
     return wrapper
 
 
 def _print_profile(df: pd.DataFrame, func_name: str):
-    """Print a clean data quality report for df."""
-    print(f"\n{'─'*50}")
-    print(f"cleanframe @profile  →  {func_name}()")
-    print(f"{'─'*50}")
-    print(f"Shape : {df.shape[0]:,} rows × {df.shape[1]} columns")
+    """Print a formatted data quality report."""
+    print(f"\ncleanframe @profile  →  {func_name}()")
+    print(f"{'Shape':<12}: {df.shape[0]} rows × {df.shape[1]} columns")
+    print(f"{'Memory':<12}: {df.memory_usage(deep=True).sum() / 1024:.1f} KB")
     print()
-    print(f"{'Column':<22} {'dtype':<12} {'nulls':>6} {'null%':>7}  note")
-    print("─" * 60)
+
+    header = f"  {'Column':<20} {'dtype':<12} {'nulls':>6}  {'null%':>6}  note"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
 
     for col in df.columns:
-        series   = df[col]
-        nulls    = int(series.isnull().sum())
-        pct      = nulls / max(len(df), 1) * 100
-        dtype_s  = str(series.dtype)
-        note     = ""
+        series = df[col]
+        nulls = int(series.isna().sum())
+        null_pct = 100 * nulls / len(series) if len(series) > 0 else 0
+        dtype = str(series.dtype)
+        notes = []
 
         if pd.api.types.is_numeric_dtype(series):
-            try:
-                skew = series.dropna().skew()
-                if abs(skew) > 1.0:
-                    note = f"skewed ({skew:+.1f})"
-            except Exception:
-                pass
-        elif pd.api.types.is_object_dtype(series):
+            clean = series.dropna()
+            if len(clean) > 2:
+                try:
+                    skew = clean.skew()
+                    if abs(skew) > 1.0:
+                        notes.append(f"skewed ({skew:+.1f})")
+                except Exception:
+                    pass
+
+        if pd.api.types.is_object_dtype(series):
             n_unique = series.nunique()
-            note = f"{n_unique} unique"
+            notes.append(f"{n_unique} unique")
 
-        print(f"  {col:<20} {dtype_s:<12} {nulls:>6} {pct:>6.1f}%  {note}")
+        note_str = ", ".join(notes)
+        flag = "⚠" if nulls > 0 else " "
+        print(f"  {flag} {col:<20} {dtype:<12} {nulls:>6}  {null_pct:>5.1f}%  {note_str}")
 
-    print(f"{'─'*50}\n")
+    print()
 
 
-# ── @pipeline ─────────────────────────────────────────────────────────────────
+# ── @pipeline ────────────────────────────────────────────────────────────────
 
-def pipeline(*schemas: Schema):
+def pipeline(*schemas: Schema, mode: str = "fix"):
     """
-    Apply multiple schemas in sequence — each step cleans progressively.
-    Use for multi-stage ML pipelines where raw cleaning and feature
-    engineering are separate concerns.
+    Decorator that applies multiple Schemas in sequence.
+    Each schema's output feeds into the next schema.
 
     Parameters
     ----------
     *schemas : Schema
-        Any number of Schema objects, applied left-to-right.
+        One or more Schema instances, applied left to right.
+    mode : str
+        "fix", "warn", or "raise" — applied to all schemas.
 
-    Example
-    -------
-        raw_schema = Schema(
-            age  = Col(null="median"),
-            dept = Col(null="Unknown"),
-        )
-        feature_schema = Schema(
-            age  = Col(clip=(0, 120), dtype="float"),
-            dept = Col(dtype="category"),
-        )
-
-        @pipeline(raw_schema, feature_schema)
-        def train(df):
-            model.fit(df)
-
-        result = train(dirty_df)
-        print(result.explain())  # shows all steps from both schemas
+    Examples
+    --------
+    >>> raw_schema     = Schema(age=Col(null="median"), dept=Col(null="mode"))
+    >>> feature_schema = Schema(age=Col(clip=(0, 120), dtype="float"))
+    >>>
+    >>> @pipeline(raw_schema, feature_schema)
+    ... def train(df):
+    ...     model.fit(df)
     """
     for i, s in enumerate(schemas):
         if not isinstance(s, Schema):
             raise TypeError(
-                f"@pipeline argument {i} must be a Schema, "
-                f"got {type(s).__name__}."
+                f"@pipeline expects Schema instances, got {type(s).__name__} "
+                f"at position {i}."
             )
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            idx, df, is_pos = _get_df_arg(func, args, kwargs)
-
-            if df is None:
-                return func(*args, **kwargs)
-
+            df, key = _get_df_arg(func, args, kwargs)
             all_steps = []
-            current_df = df
 
-            for i, schema in enumerate(schemas):
-                result = apply_schema(current_df, schema, mode="fix")
-                current_df = result.df
-                # tag each step with which pipeline stage it came from
-                for step in result.steps:
-                    step["pipeline_stage"] = i + 1
-                all_steps.extend(result.steps)
+            for schema in schemas:
+                df, steps = apply_schema(df, schema, mode=mode)
+                all_steps.extend(steps)
 
-            args, kwargs = _replace_df_arg(args, kwargs, idx, current_df, is_pos)
-            func(*args, **kwargs)
+            args, kwargs = _inject_df(args, kwargs, key, df)
+            return_value = func(*args, **kwargs)
+            return CleanResult(
+                df=df,
+                steps=all_steps,
+                return_value=return_value,
+                func_name=func.__name__,
+            )
 
-            # return combined result from all stages
-            return CleanResult(current_df, all_steps, mode="fix")
-
+        wrapper._cleanframe_decorator = "pipeline"
+        wrapper._cleanframe_schemas = schemas
         return wrapper
+
     return decorator

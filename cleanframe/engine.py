@@ -1,449 +1,226 @@
 """
-cleanframe.engine
-=================
-apply_schema() — applies a Schema to a DataFrame.
-
-Design principles:
-  - Never mutates the original df (always works on df.copy())
-  - Steps are tracked as structured dicts, not strings
-    (to_code() generates code from step data, not by parsing log strings)
-  - mode controls behaviour:
-      "fix"   — clean silently (default)
-      "warn"  — clean AND print what changed
-      "raise" — raise DataQualityError if any issue found, never fix
-  - Each column operation is independent — one column failing
-    never stops other columns from being processed
+cleanframe/engine.py
+The engine that applies a Schema to a DataFrame.
+All pandas operations live here — the decorators are just wrappers around this.
 """
+from __future__ import annotations
 
+import warnings
 import pandas as pd
-from .schema import Schema, _NULL_STRATEGIES
-from .utils import find_column, auto_strategy
 
+from .schema import Schema, Col
+from .utils import find_column, auto_strategy, collect_issues
+from .exceptions import DataQualityError
 
-class DataQualityError(Exception):
-    """
-    Raised by mode="raise" when dirty data is detected.
-    Contains structured issue list, not just a string.
-
-    Attributes
-    ----------
-    issues : list of dicts
-        Each dict: {"column": str, "problem": str, "count": int}
-    """
-
-    def __init__(self, issues: list):
-        self.issues = issues
-        lines = [
-            f"  [{i['column']}] {i['problem']} ({i['count']} value(s))"
-            for i in issues
-        ]
-        super().__init__(
-            f"Data quality issues found ({len(issues)} problem(s)):\n"
-            + "\n".join(lines)
-            + "\n\nUse mode='fix' to auto-remediate, or clean your data first."
-        )
-
-
-class CleanResult:
-    """
-    Returned by apply_schema() and by every decorator.
-
-    Attributes
-    ----------
-    df     : pd.DataFrame   — the cleaned dataframe
-    steps  : list of dicts  — structured record of every operation
-    mode   : str            — "fix" / "warn" / "raise"
-
-    Methods
-    -------
-    explain()  → human-readable report of what changed
-    to_code()  → equivalent pandas code as a string
-    summary()  → one-line summary
-    """
-
-    def __init__(self, df: pd.DataFrame, steps: list, mode: str):
-        self.df = df
-        self.steps = steps
-        self.mode = mode
-
-    # ── explain ───────────────────────────────────────────────────────────
-
-    def explain(self) -> str:
-        """Human-readable report of every operation performed."""
-        if not self.steps:
-            return "cleanframe: no changes made (no nulls or issues found)."
-
-        lines = [
-            f"cleanframe report (mode={self.mode!r})",
-            "=" * 45,
-        ]
-        for i, step in enumerate(self.steps, 1):
-            col     = step["column"]
-            op      = step["operation"]
-            detail  = step.get("detail", "")
-            count   = step.get("count", "")
-            count_s = f" ({count} value(s))" if count else ""
-            lines.append(f"{i:2}. [{col}] {op}{count_s}")
-            if detail:
-                lines.append(f"      → {detail}")
-        return "\n".join(lines)
-
-    # ── to_code ───────────────────────────────────────────────────────────
-
-    def to_code(self) -> str:
-        """
-        Returns equivalent pandas code as a string.
-        Generated from structured step data — NOT by parsing log strings.
-        Paste this into your notebook to reproduce without the library.
-        """
-        if not self.steps:
-            return "# cleanframe: no changes were needed"
-
-        lines = [
-            "import pandas as pd",
-            "",
-            "# cleanframe-generated cleaning code",
-            "# paste this to reproduce cleaning without the library",
-            "",
-        ]
-
-        for step in self.steps:
-            col = step["column"]
-            op  = step["operation"]
-            raw = step.get("raw_col", col)  # original col name before rename
-
-            reason = step.get("detail", "")
-            if reason:
-                lines.append(f"# {reason}")
-
-            if op == "fill_mean":
-                lines.append(f"df[{raw!r}] = df[{raw!r}].fillna(df[{raw!r}].mean())")
-
-            elif op == "fill_median":
-                lines.append(f"df[{raw!r}] = df[{raw!r}].fillna(df[{raw!r}].median())")
-
-            elif op == "fill_mode":
-                lines.append(f"df[{raw!r}] = df[{raw!r}].fillna(df[{raw!r}].mode()[0])")
-
-            elif op == "fill_scalar":
-                val = step.get("value")
-                lines.append(f"df[{raw!r}] = df[{raw!r}].fillna({val!r})")
-
-            elif op == "fill_ffill":
-                lines.append(f"df[{raw!r}] = df[{raw!r}].ffill()")
-
-            elif op == "fill_bfill":
-                lines.append(f"df[{raw!r}] = df[{raw!r}].bfill()")
-
-            elif op == "drop_rows":
-                lines.append(f"df = df.dropna(subset=[{raw!r}])")
-
-            elif op == "clip":
-                lo, hi = step["clip"]
-                lines.append(f"df[{raw!r}] = df[{raw!r}].clip({lo!r}, {hi!r})")
-
-            elif op == "dtype":
-                dtype = step["dtype"]
-                lines.append(f"df[{raw!r}] = df[{raw!r}].astype({dtype!r})")
-
-            elif op == "rename":
-                new_name = step["new_name"]
-                lines.append(f"df = df.rename(columns={{{raw!r}: {new_name!r}}})")
-
-            elif op == "skipped":
-                lines.append(f"# [{col}] skipped: {step.get('detail', '')}")
-
-            lines.append("")
-
-        return "\n".join(lines)
-
-    def summary(self) -> str:
-        """One-line summary for quick logging."""
-        n = len([s for s in self.steps if s["operation"] != "skipped"])
-        cols = [s["column"] for s in self.steps if s["operation"] != "skipped"]
-        return f"cleanframe: {n} operation(s) on {list(dict.fromkeys(cols))}"
-
-    def __repr__(self):
-        return (
-            f"<CleanResult mode={self.mode!r} "
-            f"steps={len(self.steps)} "
-            f"shape={self.df.shape}>"
-        )
-
-
-# ── apply_schema ──────────────────────────────────────────────────────────────
 
 def apply_schema(
     df: pd.DataFrame,
     schema: Schema,
     mode: str = "fix",
-) -> CleanResult:
+) -> tuple[pd.DataFrame, list[dict]]:
     """
     Apply a Schema to a DataFrame.
 
     Parameters
     ----------
-    df     : pd.DataFrame
+    df : pd.DataFrame
+        The input DataFrame. Original is never mutated.
     schema : Schema
-    mode   : "fix" | "warn" | "raise"
-        fix   — clean silently, return CleanResult
-        warn  — clean AND print log of every change
-        raise — raise DataQualityError if ANY issue found, never clean
+        The cleaning contract.
+    mode : str
+        "fix"   — clean silently (default)
+        "warn"  — clean and emit UserWarning for each change
+        "raise" — raise DataQualityError if any issues exist (no cleaning)
 
     Returns
     -------
-    CleanResult
-
-    Raises
-    ------
-    DataQualityError
-        Only when mode="raise" and issues are found.
-    TypeError
-        If df is not a pd.DataFrame.
+    (cleaned_df, steps)
+        cleaned_df : pd.DataFrame — a new, cleaned DataFrame
+        steps : list[dict] — structured log of every change made
     """
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError(
-            f"apply_schema expects a pd.DataFrame, got {type(df).__name__}.\n"
-            f"Did you pass the wrong argument?"
-        )
-
-    if mode not in ("fix", "warn", "raise"):
-        raise ValueError(
-            f"mode must be 'fix', 'warn', or 'raise', got {mode!r}"
-        )
-
-    # work on a copy — never mutate the original
-    result_df = df.copy()
-    steps = []
-
-    # --- mode="raise": scan first, raise before touching anything ---
     if mode == "raise":
-        issues = []
-        for col_key, rule in schema.cols.items():
-            real_col = find_column(result_df.columns, col_key)
-
-            if real_col is None:
-                if rule.required:
-                    issues.append({
-                        "column": col_key,
-                        "problem": "required column missing",
-                        "count": 1,
-                    })
-                continue
-
-            null_count = int(result_df[real_col].isnull().sum())
-            if null_count > 0 and rule.null not in (None, "ignore"):
-                issues.append({
-                    "column": real_col,
-                    "problem": f"has null values (null strategy: {rule.null!r})",
-                    "count": null_count,
-                })
-
-            if rule.clip is not None:
-                lo, hi = rule.clip
-                if pd.api.types.is_numeric_dtype(result_df[real_col]):
-                    out_of_range = int(
-                        ((result_df[real_col] < lo) | (result_df[real_col] > hi)).sum()
-                    )
-                    if out_of_range > 0:
-                        issues.append({
-                            "column": real_col,
-                            "problem": f"has {out_of_range} values outside clip range {rule.clip}",
-                            "count": out_of_range,
-                        })
-
+        issues = collect_issues(df, schema)
         if issues:
             raise DataQualityError(issues)
+        return df.copy(), []
 
-        return CleanResult(result_df, [], mode)
+    result = df.copy()
+    steps: list[dict] = []
 
-    # --- mode="fix" or "warn": clean column by column ---
-    for col_key, rule in schema.cols.items():
+    pd.set_option('future.no_silent_downcasting', True)  # ← add this
 
-        real_col = find_column(result_df.columns, col_key)
+    for col_name, col_rule in schema:
+        actual = find_column(result, col_name)
 
-        # column not found
-        if real_col is None:
-            if rule.required:
+        # Column not found in DataFrame
+        if actual is None:
+            if col_rule.required:
                 raise KeyError(
-                    f"Required column {col_key!r} not found in DataFrame.\n"
-                    f"Available columns: {list(result_df.columns)}\n"
-                    f"Check for typos or case mismatches."
+                    f"Required column '{col_name}' not found in DataFrame. "
+                    f"Available columns: {list(result.columns)}"
                 )
             steps.append({
-                "column":    col_key,
-                "operation": "skipped",
-                "detail":    "column not in DataFrame (set required=True to raise instead)",
+                "action": "skip",
+                "column": col_name,
+                "reason": "column not found in DataFrame",
             })
             continue
 
-        # ── null handling ─────────────────────────────────────────────────
-        null_strategy = rule.null
+        # ── 1. Null handling ────────────────────────────────────────────────
+        null_count = int(result[actual].isna().sum())
 
-        if null_strategy == "auto":
-            null_strategy = auto_strategy(real_col, result_df[real_col])
+        if null_count > 0 and col_rule.null != "ignore":
+            strategy = col_rule.null
 
-        null_count = int(result_df[real_col].isnull().sum())
+            # Resolve "auto"
+            if strategy == "auto":
+                strategy = auto_strategy(result[actual], actual)
 
-        if null_strategy is not None and null_strategy != "ignore" and null_count > 0:
+            # Apply strategy
+            if strategy == "mean":
+                fill_val = result[actual].mean()
+                result[actual] = result[actual].fillna(fill_val).infer_objects(copy=False)
+                _record_fill(steps, actual, "mean", fill_val, null_count, mode)
 
-            if null_strategy == "mean":
-                if not pd.api.types.is_numeric_dtype(result_df[real_col]):
-                    steps.append({
-                        "column":    real_col,
-                        "operation": "skipped",
-                        "detail":    "null='mean' requires numeric column",
-                        "raw_col":   real_col,
-                    })
-                else:
-                    val = result_df[real_col].mean()
-                    result_df[real_col] = result_df[real_col].fillna(val)
-                    steps.append({
-                        "column":    real_col,
-                        "operation": "fill_mean",
-                        "detail":    f"filled with mean ({val:.4g})",
-                        "count":     null_count,
-                        "raw_col":   real_col,
-                    })
+            elif strategy == "median":
+                fill_val = result[actual].median()
+                result[actual] = result[actual].fillna(fill_val).infer_objects(copy=False)
+                _record_fill(steps, actual, "median", fill_val, null_count, mode)
 
-            elif null_strategy == "median":
-                if not pd.api.types.is_numeric_dtype(result_df[real_col]):
-                    steps.append({
-                        "column":    real_col,
-                        "operation": "skipped",
-                        "detail":    "null='median' requires numeric column",
-                        "raw_col":   real_col,
-                    })
-                else:
-                    val = result_df[real_col].median()
-                    result_df[real_col] = result_df[real_col].fillna(val)
-                    steps.append({
-                        "column":    real_col,
-                        "operation": "fill_median",
-                        "detail":    f"filled with median ({val:.4g})",
-                        "count":     null_count,
-                        "raw_col":   real_col,
-                    })
+            elif strategy == "mode":
+                mode_vals = result[actual].mode()
+                fill_val = mode_vals.iloc[0] if len(mode_vals) > 0 else None
+                if fill_val is not None:
+                    result[actual] = result[actual].fillna(fill_val).infer_objects(copy=False)
+                _record_fill(steps, actual, "mode", fill_val, null_count, mode)
 
-            elif null_strategy == "mode":
-                mode_vals = result_df[real_col].mode()
-                if len(mode_vals) == 0:
-                    steps.append({
-                        "column":    real_col,
-                        "operation": "skipped",
-                        "detail":    "null='mode' but column is all null",
-                        "raw_col":   real_col,
-                    })
-                else:
-                    val = mode_vals[0]
-                    result_df[real_col] = result_df[real_col].fillna(val)
-                    steps.append({
-                        "column":    real_col,
-                        "operation": "fill_mode",
-                        "detail":    f"filled with mode ({val!r})",
-                        "count":     null_count,
-                        "raw_col":   real_col,
-                    })
+            elif strategy == "drop":
+                before_len = len(result)
+                result = result.dropna(subset=[actual]).reset_index(drop=True)
+                dropped = before_len - len(result)
+                step = {
+                    "action": "fill_null",
+                    "column": actual,
+                    "strategy": "drop",
+                    "rows_dropped": dropped,
+                    "code": f"df = df.dropna(subset=['{actual}']).reset_index(drop=True)",
+                }
+                steps.append(step)
+                if mode == "warn":
+                    warnings.warn(
+                        f"cleanframe [@clean]: dropped {dropped} rows with null '{actual}'",
+                        UserWarning, stacklevel=6,
+                    )
 
-            elif null_strategy == "drop":
-                result_df = result_df.dropna(subset=[real_col]).reset_index(drop=True)
-                steps.append({
-                    "column":    real_col,
-                    "operation": "drop_rows",
-                    "detail":    f"dropped {null_count} rows with null values",
-                    "count":     null_count,
-                    "raw_col":   real_col,
-                })
+            elif strategy == "ffill":
+                result[actual] = result[actual].ffill().infer_objects(copy=False)
+                _record_fill(steps, actual, "ffill", None, null_count, mode)
 
-            elif null_strategy == "ffill":
-                result_df[real_col] = result_df[real_col].ffill()
-                steps.append({
-                    "column":    real_col,
-                    "operation": "fill_ffill",
-                    "detail":    "forward-filled null values",
-                    "count":     null_count,
-                    "raw_col":   real_col,
-                })
+            elif strategy == "bfill":
+                result[actual] = result[actual].bfill().infer_objects(copy=False)
+                _record_fill(steps, actual, "bfill", None, null_count, mode)
 
-            elif null_strategy == "bfill":
-                result_df[real_col] = result_df[real_col].bfill()
-                steps.append({
-                    "column":    real_col,
-                    "operation": "fill_bfill",
-                    "detail":    "backward-filled null values",
-                    "count":     null_count,
-                    "raw_col":   real_col,
-                })
+            elif strategy == "ignore":
+                pass  # intentionally skip
 
             else:
-                # scalar fill — any value including 0, "Unknown", False
-                result_df[real_col] = result_df[real_col].fillna(null_strategy)
-                steps.append({
-                    "column":    real_col,
-                    "operation": "fill_scalar",
-                    "detail":    f"filled with value {null_strategy!r}",
-                    "count":     null_count,
-                    "value":     null_strategy,
-                    "raw_col":   real_col,
-                })
+                # Scalar fill value
+                result[actual] = result[actual].fillna(strategy)
+                _record_fill(steps, actual, f"scalar({strategy!r})", strategy, null_count, mode)
 
-        # ── clip ──────────────────────────────────────────────────────────
-        if rule.clip is not None:
-            lo, hi = rule.clip
-            if not pd.api.types.is_numeric_dtype(result_df[real_col]):
-                steps.append({
-                    "column":    real_col,
-                    "operation": "skipped",
-                    "detail":    f"clip={rule.clip} requires numeric column",
-                    "raw_col":   real_col,
-                })
-            else:
-                out_count = int(
-                    ((result_df[real_col] < lo) | (result_df[real_col] > hi)).sum()
-                )
-                result_df[real_col] = result_df[real_col].clip(lo, hi)
-                steps.append({
-                    "column":    real_col,
-                    "operation": "clip",
-                    "detail":    f"clipped to ({lo}, {hi}) — {out_count} values affected",
-                    "count":     out_count,
-                    "clip":      (lo, hi),
-                    "raw_col":   real_col,
-                })
+        # ── 2. Clip ─────────────────────────────────────────────────────────
+        if col_rule.clip is not None:
+            if pd.api.types.is_numeric_dtype(result[actual]):
+                lo, hi = col_rule.clip
+                out_of_range = int(((result[actual] < lo) | (result[actual] > hi)).sum())
+                if out_of_range > 0:
+                    result[actual] = result[actual].clip(lower=lo, upper=hi)
+                    step = {
+                        "action": "clip",
+                        "column": actual,
+                        "clip_min": lo,
+                        "clip_max": hi,
+                        "before": out_of_range,
+                        "code": f"df['{actual}'] = df['{actual}'].clip(lower={lo}, upper={hi})",
+                    }
+                    steps.append(step)
+                    if mode == "warn":
+                        warnings.warn(
+                            f"cleanframe [@clean]: clipped {out_of_range} value(s) in '{actual}' to [{lo}, {hi}]",
+                            UserWarning, stacklevel=6,
+                        )
+            # Non-numeric column with clip — silently skip (don't raise)
 
-        # ── dtype coerce ──────────────────────────────────────────────────
-        if rule.dtype is not None:
+        # ── 3. Dtype coercion ────────────────────────────────────────────────
+        if col_rule.dtype is not None:
             try:
-                result_df[real_col] = result_df[real_col].astype(rule.dtype)
-                steps.append({
-                    "column":    real_col,
-                    "operation": "dtype",
-                    "detail":    f"coerced to dtype={rule.dtype!r}",
-                    "dtype":     rule.dtype,
-                    "raw_col":   real_col,
-                })
-            except (ValueError, TypeError) as e:
-                steps.append({
-                    "column":    real_col,
-                    "operation": "skipped",
-                    "detail":    f"dtype coerce to {rule.dtype!r} failed: {e}",
-                    "raw_col":   real_col,
-                })
+                old_dtype = str(result[actual].dtype)
+                result[actual] = _coerce_dtype(result[actual], col_rule.dtype)
+                new_dtype = str(result[actual].dtype)
+                if old_dtype != new_dtype:
+                    steps.append({
+                        "action": "dtype",
+                        "column": actual,
+                        "from": old_dtype,
+                        "to": new_dtype,
+                        "code": f"df['{actual}'] = df['{actual}'].astype('{col_rule.dtype}')",
+                    })
+            except Exception as e:
+                warnings.warn(
+                    f"cleanframe: could not coerce '{actual}' to dtype '{col_rule.dtype}': {e}",
+                    UserWarning, stacklevel=6,
+                )
 
-        # ── rename ────────────────────────────────────────────────────────
-        if rule.rename is not None:
-            result_df = result_df.rename(columns={real_col: rule.rename})
+        # ── 4. Rename ────────────────────────────────────────────────────────
+        if col_rule.rename is not None:
+            result = result.rename(columns={actual: col_rule.rename})
             steps.append({
-                "column":    real_col,
-                "operation": "rename",
-                "detail":    f"renamed to {rule.rename!r}",
-                "new_name":  rule.rename,
-                "raw_col":   real_col,
+                "action": "rename",
+                "column": actual,
+                "to": col_rule.rename,
+                "code": f"df = df.rename(columns={{'{actual}': '{col_rule.rename}'}})",
             })
 
-    # warn mode — print everything that happened
-    if mode == "warn":
-        cr = CleanResult(result_df, steps, mode)
-        print(cr.explain())
+    return result, steps
 
-    return CleanResult(result_df, steps, mode)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _record_fill(steps, col, strategy, fill_val, null_count, mode):
+    """Record a null-fill step and optionally warn."""
+    if strategy in ("ffill", "bfill"):
+        code = f"df['{col}'] = df['{col}'].{strategy}()"
+    elif fill_val is not None:
+        code = f"df['{col}'] = df['{col}'].fillna({fill_val!r})"
+    else:
+        code = f"# '{col}': no fill value available (e.g. all-null column)"
+
+    step = {
+        "action": "fill_null",
+        "column": col,
+        "strategy": strategy,
+        "fill_value": fill_val,
+        "nulls_filled": null_count,
+        "code": code,
+    }
+    steps.append(step)
+
+    if mode == "warn":
+        warnings.warn(
+            f"cleanframe [@clean]: filled {null_count} null(s) in '{col}' using {strategy}"
+            + (f" (value={fill_val!r})" if fill_val is not None else ""),
+            UserWarning, stacklevel=7,
+        )
+
+
+def _coerce_dtype(series: pd.Series, dtype: str) -> pd.Series:
+    """Coerce a Series to the target dtype string."""
+    mapping = {
+        "int":      lambda s: pd.to_numeric(s, errors="coerce").astype("Int64"),
+        "float":    lambda s: pd.to_numeric(s, errors="coerce").astype("float64"),
+        "str":      lambda s: s.astype(str),
+        "bool":     lambda s: s.astype(bool),
+        "category": lambda s: s.astype("category"),
+        "datetime": lambda s: pd.to_datetime(s, errors="coerce"),
+    }
+    return mapping[dtype](series)
